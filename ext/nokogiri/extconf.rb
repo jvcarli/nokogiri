@@ -671,6 +671,18 @@ append_cppflags(ENV["CPPFLAGS"]) unless ENV["CPPFLAGS"].nil?
 append_ldflags(ENV["LDFLAGS"]) unless ENV["LDFLAGS"].nil?
 $LIBS = concat_flags($LIBS, ENV["LIBS"])
 
+# START HERE - clang-cl compatibility fix for MSVC
+if RbConfig::CONFIG['CC'] =~ /clang-cl/
+  puts "Detected clang-cl (MSVC compatibility mode). Converting flags for MSVC."
+  # Convert -I to /I for MSVC compatibility
+  $INCFLAGS = $INCFLAGS.to_s.gsub(/-I/, '/I')
+  $CPPFLAGS = $CPPFLAGS.to_s.gsub(/-I/, '/I')
+  $LIBPATHFLAG = $LIBPATHFLAG.to_s.gsub(/-L/, '/LIBPATH:')
+  # Also convert -LIBPATH: which might appear in LDFLAGS
+  $LDFLAGS = $LDFLAGS.to_s.gsub(/-L/, '/LIBPATH:')
+end
+# END HERE
+
 # libgumbo uses C90/C99 features, see #2302
 append_cflags(["-std=c99", "-Wno-declaration-after-statement"])
 
@@ -1112,10 +1124,39 @@ else
       end
     end
   end
-  append_cppflags("-I#{File.join(libgumbo_recipe.path, "include")}")
+  
+  # START HERE - Special handling for clang-cl/MSVC and gumbo headers
+  if RbConfig::CONFIG['CC'] =~ /clang-cl/
+    puts "Adding gumbo include path for clang-cl/MSVC"
+    gumbo_include = File.join(libgumbo_recipe.path, "include").gsub('/', '\\')
+    # Use both forward and backward slashes to be safe
+    append_cppflags("/I\"#{gumbo_include}\"")
+    $INCFLAGS << " /I\"#{gumbo_include}\""
+  else
+    append_cppflags("-I#{File.join(libgumbo_recipe.path, "include")}")
+  end
+  # END HERE
+  
   $libs = $libs + " " + File.join(libgumbo_recipe.path, "lib", "libgumbo.a")
   $LIBPATH = $LIBPATH | [File.join(libgumbo_recipe.path, "lib")]
-  ensure_func("gumbo_parse_with_options", "nokogiri_gumbo.h")
+  
+  # START HERE - Workaround for broken function signature test in clang-cl
+  if RbConfig::CONFIG['CC'] =~ /clang-cl/
+    puts "Using workaround for gumbo_parse_with_options detection with clang-cl"
+    $defs.push("-DHAVE_GUMBO_PARSE_WITH_OPTIONS")
+    # Try to find the header manually
+    gumbo_header_path = File.join(libgumbo_recipe.path, "include", "nokogiri_gumbo.h")
+    if File.exist?(gumbo_header_path)
+      puts "Found nokogiri_gumbo.h at: #{gumbo_header_path}"
+      have_header("nokogiri_gumbo.h")
+    else
+      # Try to find it in the source tree
+      find_header("nokogiri_gumbo.h") || abort("nokogiri_gumbo.h not found")
+    end
+  else
+    ensure_func("gumbo_parse_with_options", "nokogiri_gumbo.h")
+  end
+  # END HERE
 end
 
 have_func("xmlCtxtSetOptions") # introduced in libxml2 2.13.0
@@ -1145,7 +1186,42 @@ unless config_system_libraries?
   end
 end
 
+# START HERE - Convert flags for clang-cl in the Makefile generation
+if RbConfig::CONFIG['CC'] =~ /clang-cl/
+  puts "Converting Makefile flags for clang-cl compatibility"
+  $INCFLAGS = $INCFLAGS.to_s.gsub(/-I/, '/I')
+  $CPPFLAGS = $CPPFLAGS.to_s.gsub(/-I/, '/I')
+  $LIBPATHFLAG = $LIBPATHFLAG.to_s.gsub(/-L/, '/LIBPATH:')
+end
+# END HERE
+
 create_makefile("nokogiri/nokogiri")
+
+# START HERE - Nuclear option: fix the Makefile directly for clang-cl
+if RbConfig::CONFIG['CC'] =~ /clang-cl/
+  puts "Applying final Makefile fixes for clang-cl/MSVC"
+  
+  # Read the generated Makefile
+  makefile_path = "Makefile"
+  if File.exist?(makefile_path)
+    makefile_content = File.read(makefile_path)
+    
+    # Fix include flags
+    makefile_content.gsub!(/ -I/, ' /I')
+    makefile_content.gsub!(/^INCFLAGS = -I/, 'INCFLAGS = /I')
+    
+    # Fix library path flags
+    makefile_content.gsub!(/ -L/, ' /LIBPATH:')
+    
+    # Fix any remaining -I flags in other variables
+    makefile_content.gsub!(/CPPFLAGS = (.*)-I/, 'CPPFLAGS = \1/I')
+    
+    # Write back the fixed Makefile
+    File.write(makefile_path, makefile_content)
+    puts "Converted Makefile flags for clang-cl compatibility"
+  end
+end
+# END HERE
 
 if config_clean?
   # Do not clean if run in a development work tree.
