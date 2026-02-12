@@ -230,8 +230,6 @@ def local_have_library(lib, func = nil, headers = nil)
 end
 
 def zlib_source(version_string)
-  # As of 2022-12, I'm starting to see failed downloads often enough from zlib.net that I want to
-  # change the default to github.
   if ENV["NOKOGIRI_USE_CANONICAL_ZLIB_SOURCE"]
     "https://zlib.net/fossils/zlib-#{version_string}.tar.gz"
   else
@@ -248,18 +246,13 @@ def LOCAL_PACKAGE_RESPONSE.%(package)
   package ? "yes: #{package}" : "no"
 end
 
-# wrapper around MakeMakefil#pkg_config and the PKGConfig gem
 def try_package_configuration(pc)
   unless ENV.key?("NOKOGIRI_TEST_PKG_CONFIG_GEM")
-    # try MakeMakefile#pkg_config, which uses the system utility `pkg-config`.
     return if checking_for("#{pc} using `pkg_config`", LOCAL_PACKAGE_RESPONSE) do
       pkg_config(pc)
     end
   end
 
-  # `pkg-config` probably isn't installed, which appears to be the case for lots of freebsd systems.
-  # let's fall back to the pkg-config gem, which knows how to parse .pc files, and wrap it with the
-  # same logic as MakeMakefile#pkg_config
   begin
     require "rubygems"
     gem("pkg-config", REQUIRED_PKG_CONFIG_VERSION)
@@ -282,21 +275,18 @@ def try_package_configuration(pc)
   end
 end
 
-# set up mkmf to link against the library if we can find it
 def have_package_configuration(opt: nil, pc: nil, lib:, func:, headers:)
   if opt
     dir_config(opt)
     dir_config("opt")
   end
 
-  # see if we have enough path info to do this without trying any harder
   unless ENV.key?("NOKOGIRI_TEST_PKG_CONFIG")
     return true if local_have_library(lib, func, headers)
   end
 
   try_package_configuration(pc) if pc
 
-  # verify that we can compile and link against the library
   local_have_library(lib, func, headers)
 end
 
@@ -322,25 +312,11 @@ def abort_could_not_find_library(lib)
 end
 
 def chdir_for_build(&block)
-  # When using rake-compiler-dock on Windows, the underlying Virtualbox shared
-  # folders don't support symlinks, but libiconv expects it for a build on
-  # Linux. We work around this limitation by using the temp dir for cooking.
   build_dir = /mingw|mswin|cygwin/.match?(ENV["RCD_HOST_RUBY_PLATFORM"].to_s) ? "/tmp" : "."
   Dir.chdir(build_dir, &block)
 end
 
 def sh_export_path(path)
-  # because libxslt 1.1.29 configure.in uses AC_PATH_TOOL which treats ":"
-  # as a $PATH separator, we need to convert windows paths from
-  #
-  #   C:/path/to/foo
-  #
-  # to
-  #
-  #   /C/path/to/foo
-  #
-  # which is sh-compatible, in order to find things properly during
-  # configuration
   return path unless windows?
 
   match = Regexp.new("^([A-Z]):(/.*)").match(path)
@@ -398,7 +374,6 @@ def try_link_iconv(using = nil)
 end
 
 def iconv_configure_flags
-  # give --with-iconv-dir and --with-opt-dir first priority
   ["iconv", "opt"].each do |target|
     config = preserving_globals { dir_config(target) }
     next unless config.any? && try_link_iconv("--with-#{target}-* flags") { dir_config(target) }
@@ -437,7 +412,7 @@ end
 
 def process_recipe(name, version, static_p, cross_p, cacheable_p = true)
   require "rubygems"
-  gem("mini_portile2", REQUIRED_MINI_PORTILE_VERSION) # gemspec is not respected at install time
+  gem("mini_portile2", REQUIRED_MINI_PORTILE_VERSION)
   require "mini_portile2"
   message("Using mini_portile version #{MiniPortile::VERSION}\n")
 
@@ -450,8 +425,6 @@ def process_recipe(name, version, static_p, cross_p, cacheable_p = true)
       "#{@target}/#{RUBY_PLATFORM}/#{@name}/#{@version}"
     end
 
-    # We use 'host' to set compiler prefix for cross-compiling. Prefer host_alias over host. And
-    # prefer i686 (what external dev tools use) to i386 (what ruby's configure.ac emits).
     recipe.host = RbConfig::CONFIG["host_alias"].empty? ? RbConfig::CONFIG["host"] : RbConfig::CONFIG["host_alias"]
     recipe.host = recipe.host.gsub("i386", "i686")
 
@@ -524,14 +497,12 @@ def process_recipe(name, version, static_p, cross_p, cacheable_p = true)
 
       unless recipe.patch_files.empty?
         message("The following patches are being applied:\n")
-
         recipe.patch_files.each do |patch|
           message(format("  - %s\n", File.basename(patch)))
         end
       end
 
       message(<<~EOM) if name != "libgumbo"
-
         The Nokogiri maintainers intend to provide timely security updates, but if
         this is a concern for you and want to use your OS/distro system library
         instead, then abort this installation process and install nokogiri as
@@ -571,20 +542,14 @@ def do_clean
   root = Pathname(PACKAGE_ROOT_DIR)
   pwd  = Pathname(Dir.pwd)
 
-  # Skip if this is a development work tree
   unless (root + ".git").exist?
     message("Cleaning files only used during build.\n")
 
-    # (root + 'tmp') cannot be removed at this stage because
-    # nokogiri.so is yet to be copied to lib.
-
-    # clean the ports build directory
     Pathname.glob(pwd.join("tmp", "*", "ports")) do |dir|
       FileUtils.rm_rf(dir, verbose: true)
     end
 
     if config_static?
-      # ports installation can be safely removed if statically linked.
       FileUtils.rm_rf(root + "ports", verbose: true)
     else
       FileUtils.rm_rf(root + "ports" + "archives", verbose: true)
@@ -594,28 +559,6 @@ def do_clean
   exit!(0)
 end
 
-# In ruby 3.2, symbol resolution changed on Darwin, to introduce the `-bundle_loader` flag to
-# resolve symbols against the ruby binary.
-#
-# This makes it challenging to build a single extension that works with both a ruby with
-# `--enable-shared` and one with `--disable-shared. To work around that, we choose to add
-# `-flat_namespace` to the link line (later in this file).
-#
-# The `-flat_namespace` line introduces its own behavior change, which is that (similar to on
-# Linux), any symbols in the extension that are exported may now be resolved by shared libraries
-# loaded by the Ruby process. Specifically, that means that libxml2 and libxslt, which are
-# statically linked into the nokogiri bundle, will resolve (at runtime) to a system libxml2 loaded
-# by Ruby on Darwin. And it appears that often Ruby on Darwin does indeed load the system libxml2,
-# and that messes with our assumptions about whether we're running with a patched libxml2 or a
-# vanilla libxml2.
-#
-# We choose to use `-load_hidden` in this case to prevent exporting those symbols from libxml2 and
-# libxslt, which ensures that they will be resolved to the static libraries in the bundle. In other
-# words, when we use `load_hidden`, what happens in the extension stays in the extension.
-#
-# See https://github.com/rake-compiler/rake-compiler-dock/issues/87 for more info.
-#
-# Anyway, this method is the logical bit to tell us when to turn on these workarounds.
 def needs_darwin_linker_hack
   config_cross_build? &&
     darwin? &&
@@ -648,7 +591,6 @@ if ENV["LD"]
   RbConfig::CONFIG["LD"] = RbConfig::MAKEFILE_CONFIG["LD"] = ENV["LD"]
 end
 
-# use same toolchain for libxml and libxslt
 ENV["AR"] = RbConfig::CONFIG["AR"]
 ENV["CC"] = RbConfig::CONFIG["CC"]
 ENV["LD"] = RbConfig::CONFIG["LD"]
@@ -665,7 +607,6 @@ if arg_config("--prevent-strip")
   puts "Prevent stripping by removing '-s' from $DLDFLAGS" if old_dldflags != $DLDFLAGS
 end
 
-# adopt environment config
 append_cflags(ENV["CFLAGS"]) unless ENV["CFLAGS"].nil?
 append_cppflags(ENV["CPPFLAGS"]) unless ENV["CPPFLAGS"].nil?
 append_ldflags(ENV["LDFLAGS"]) unless ENV["LDFLAGS"].nil?
@@ -744,41 +685,23 @@ if using_msvc?
 end
 # ============================================================
 
-# libgumbo uses C90/C99 features, see #2302
 append_cflags(["-std=c99", "-Wno-declaration-after-statement"]) unless using_msvc?
-
-# gumbo html5 serialization is slower with O3, let's make sure we use O2
 append_cflags("-O2") unless using_msvc?
-
-# always include debugging information
 append_cflags("-g") unless using_msvc?
-
-# we use at least one inline function in the C extension
 append_cflags("-Winline") unless using_msvc?
-
-# good to have no matter what Ruby was compiled with
 append_cflags("-Wmissing-noreturn") unless using_msvc?
-
-# check integer loss of precision. this flag won't generally work until Ruby 3.4.
-# see https://bugs.ruby-lang.org/issues/20507
 append_cflags("-Wconversion") unless using_msvc?
 
-# handle clang variations, see #1101
 if darwin?
   append_cflags("-Wno-error=unused-command-line-argument-hard-error-in-future")
   append_cflags("-Wno-unknown-warning-option")
 end
 
-# these tend to be noisy, but on occasion useful during development
-# append_cflags(["-Wcast-qual", "-Wwrite-strings"])
-
-# Add SDK-specific include path for macOS and brew versions before v2.2.12 (2020-04-08) [#1851, #1801]
 macos_mojave_sdk_include_path = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libxml2"
 if config_system_libraries? && darwin? && Dir.exist?(macos_mojave_sdk_include_path) && !nix?
   append_cppflags("-I#{macos_mojave_sdk_include_path}")
 end
 
-# Work around a character escaping bug in MSYS by passing an arbitrary double-quoted parameter to gcc.
 append_cppflags(' "-Idummypath"') if windows? && !using_msvc?
 
 if config_system_libraries?
@@ -818,6 +741,35 @@ if config_system_libraries?
     abort("ERROR: libxml2 version #{REQUIRED_LIBXML_VERSION} or later is required!")
   have_libxml_headers?(RECOMMENDED_LIBXML_VERSION) ||
     warn("WARNING: libxml2 version #{RECOMMENDED_LIBXML_VERSION} or later is highly recommended, but proceeding anyway.")
+
+  # ============================================================
+  # CRITICAL FIX: MSVC library name mapping for Conda/Windows
+  # ============================================================
+  if using_msvc?
+    puts "Applying MSVC library name mapping for Conda/Windows..."
+    
+    # Force the correct library names (libxslt.lib, libexslt.lib not xslt.lib, exslt.lib)
+    $libs = $libs.to_s.gsub(/\bxslt\.lib\b/, 'libxslt.lib')
+    $libs = $libs.to_s.gsub(/\bexslt\.lib\b/, 'libexslt.lib')
+    $libs = $libs.to_s.gsub(/\bxslt\s+/, 'libxslt.lib ')
+    $libs = $libs.to_s.gsub(/\bexslt\s+/, 'libexslt.lib ')
+    
+    $LDFLAGS = $LDFLAGS.to_s.gsub(/\bxslt\.lib\b/, 'libxslt.lib')
+    $LDFLAGS = $LDFLAGS.to_s.gsub(/\bexslt\.lib\b/, 'libexslt.lib')
+    $DLDFLAGS = $DLDFLAGS.to_s.gsub(/\bxslt\.lib\b/, 'libxslt.lib')
+    $DLDFLAGS = $DLDFLAGS.to_s.gsub(/\bexslt\.lib\b/, 'libexslt.lib')
+    
+    # Also add explicit library paths if environment variables are set
+    if ENV['NOKOGIRI_XSLT_LIB']
+      append_ldflags("/LIBPATH:#{ENV['NOKOGIRI_XSLT_LIB'].gsub('/', '\\')}")
+    end
+    if ENV['NOKOGIRI_XML2_LIB']
+      append_ldflags("/LIBPATH:#{ENV['NOKOGIRI_XML2_LIB'].gsub('/', '\\')}")
+    end
+    
+    puts "Fixed library names: #{$libs}"
+  end
+  # ============================================================
 
 else
   message "Building nokogiri using packaged libraries.\n"
@@ -880,7 +832,6 @@ else
               env["CHOST"] = host
               execute("configure", ["./configure", "--static", configure_prefix], { env: env })
               if darwin?
-                # needed as of zlib 1.2.13
                 Dir.chdir(work_path) do
                   makefile = File.read("Makefile").gsub(/^AR=.*$/, "AR=#{host}-libtool")
                   File.open("Makefile", "w") { |m| m.write(makefile) }
@@ -904,7 +855,6 @@ else
           sha256: dependencies["libiconv"]["sha256"],
         }]
 
-        # The libiconv configure script doesn't accept "arm64" host string but "aarch64"
         recipe.host = recipe.host.gsub("arm64-apple-darwin", "aarch64-apple-darwin")
 
         cflags = concat_flags(ENV["CFLAGS"], "-O2", "-g")
@@ -1065,15 +1015,13 @@ else
       libname = recipe.name[/\Alib(.+)\z/, 1]
       config_basename = "#{libname}-config"
       File.join(recipe.path, "bin", config_basename).tap do |config|
-        # call config scripts explicit with 'sh' for compat with Windows
         cflags = %x(sh #{config} --cflags).strip
         message("#{config_basename} cflags: #{cflags}\n")
-        $CPPFLAGS = concat_flags(cflags, $CPPFLAGS) # prepend
+        $CPPFLAGS = concat_flags(cflags, $CPPFLAGS)
 
         %x(sh #{config} --libs).strip.shellsplit.each do |arg|
           case arg
           when /\A-L(.+)\z/
-            # Prioritize ports' directories
             $LIBPATH = if Regexp.last_match(1).start_with?(PACKAGE_ROOT_DIR + "/")
               [Regexp.last_match(1)] | $LIBPATH
             else
@@ -1092,15 +1040,10 @@ else
 
       case libname
       when "xml2"
-        # xslt-config --libs or pkg-config libxslt --libs does not include
-        # -llzma, so we need to add it manually when linking statically.
         if static_p && preserving_globals { local_have_library("lzma") }
-          # Add it at the end; GH #988
           libs << "-llzma"
         end
       when "xslt"
-        # xslt-config does not have a flag to emit options including
-        # -lexslt, so add it manually.
         libs.unshift("-lexslt")
       end
     end
@@ -1155,7 +1098,6 @@ else
       end
 
       def configured?
-        # For MSVC/clang-cl, we need to generate a Makefile
         if using_msvc?
           false
         else
@@ -1168,7 +1110,6 @@ else
           Dir.chdir(work_path) do
             output("Generating MSVC-compatible Makefile for libgumbo...")
             
-            # Get all .c files
             c_files = Dir.glob("*.c").map { |f| f.gsub('/', '\\') }
             obj_files = c_files.map { |f| f.gsub('.c', '.obj') }
             
@@ -1203,7 +1144,6 @@ else
 
       def compile
         if using_msvc?
-          # Try nmake first, fall back to make
           if system("where nmake >nul 2>nul")
             output("Using nmake to compile libgumbo...")
             execute("compile", "nmake /nologo")
@@ -1222,13 +1162,11 @@ else
         FileUtils.mkdir_p([lib_dir, inc_dir])
         
         if using_msvc?
-          # MSVC: libgumbo.a is actually a .lib file
           lib_file = File.join(work_path, "libgumbo.a")
           if File.exist?(lib_file)
             FileUtils.cp(lib_file, File.join(lib_dir, "libgumbo.a"))
             output("Installed libgumbo.a to #{lib_dir}")
           else
-            # Try alternative name
             lib_file = File.join(work_path, "libgumbo.lib")
             if File.exist?(lib_file)
               FileUtils.cp(lib_file, File.join(lib_dir, "libgumbo.a"))
@@ -1239,7 +1177,6 @@ else
           FileUtils.cp(File.join(work_path, "libgumbo.a"), lib_dir)
         end
         
-        # Copy header files
         headers = Dir.glob(File.join(work_path, "*.h"))
         FileUtils.cp(headers, inc_dir)
         output("Installed #{headers.size} header files to #{inc_dir}")
@@ -1248,7 +1185,6 @@ else
   end
   # ============================================================
 
-  # Add gumbo include path with MSVC-compatible flags
   if using_msvc?
     gumbo_include = File.join(libgumbo_recipe.path, "include").gsub('/', '\\')
     $CPPFLAGS = "/I\"#{gumbo_include}\" #{$CPPFLAGS}"
@@ -1260,7 +1196,6 @@ else
   $libs = $libs + " " + File.join(libgumbo_recipe.path, "lib", "libgumbo.a")
   $LIBPATH = $LIBPATH | [File.join(libgumbo_recipe.path, "lib")]
   
-  # For MSVC/clang-cl, define the function directly since detection often fails
   if using_msvc?
     $defs.push("-DHAVE_GUMBO_PARSE_WITH_OPTIONS")
     have_header("nokogiri_gumbo.h") || abort("nokogiri_gumbo.h not found")
@@ -1269,25 +1204,22 @@ else
   end
 end
 
-have_func("xmlCtxtSetOptions") # introduced in libxml2 2.13.0
-have_func("xmlCtxtGetOptions") # introduced in libxml2 2.14.0
-have_func("xmlSwitchEncodingName") # introduced in libxml2 2.13.0
-have_func("xmlAddIDSafe") # introduced in libxml2 2.13.0
-have_func("rb_category_warning") # introduced in Ruby 3.0 but had trouble resolving this symbol in truffleruby
+have_func("xmlCtxtSetOptions")
+have_func("xmlCtxtGetOptions")
+have_func("xmlSwitchEncodingName")
+have_func("xmlAddIDSafe")
+have_func("rb_category_warning")
 
 other_library_versions_string = OTHER_LIBRARY_VERSIONS.map { |k, v| [k, v].join(":") }.join(",")
 append_cppflags(%[-DNOKOGIRI_OTHER_LIBRARY_VERSIONS="\\"#{other_library_versions_string}\\""])
 
 unless config_system_libraries?
   if cross_build_p
-    # When precompiling native gems, copy packaged libraries' headers to ext/nokogiri/include
-    # These are packaged up by the cross-compiling callback in the ExtensionTask
     copy_packaged_libraries_headers(
       to_path: File.join(PACKAGE_ROOT_DIR, "ext/nokogiri/include"),
       from_recipes: [libxml2_recipe, libxslt_recipe],
     )
   else
-    # When compiling during installation, install packaged libraries' header files into ext/nokogiri/include
     copy_packaged_libraries_headers(
       to_path: "include",
       from_recipes: [libxml2_recipe, libxslt_recipe],
@@ -1302,17 +1234,22 @@ end
 if using_msvc?
   puts "Performing final MSVC/clang-cl flag conversion..."
   
-  # Ensure LIBPATHFLAG is set correctly
   $LIBPATHFLAG = ' /LIBPATH:%s'
   
-  # Convert any remaining Unix-style flags
   $INCFLAGS = $INCFLAGS.to_s.gsub(/-I/, '/I')
   $CPPFLAGS = $CPPFLAGS.to_s.gsub(/-I/, '/I')
   $LDFLAGS = $LDFLAGS.to_s.gsub(/-L/, '/LIBPATH:')
   $DLDFLAGS = $DLDFLAGS.to_s.gsub(/-L/, '/LIBPATH:')
   
+  # Final pass of library name mapping
+  $libs = $libs.to_s.gsub(/\bxslt\.lib\b/, 'libxslt.lib')
+  $libs = $libs.to_s.gsub(/\bexslt\.lib\b/, 'libexslt.lib')
+  $libs = $libs.to_s.gsub(/\bxslt\s+/, 'libxslt.lib ')
+  $libs = $libs.to_s.gsub(/\bexslt\s+/, 'libexslt.lib ')
+  
   puts "Final CFLAGS: #{$CFLAGS}"
   puts "Final LDFLAGS: #{$LDFLAGS}"
+  puts "Final LIBS: #{$libs}"
   puts "Final INCFLAGS: #{$INCFLAGS}"
 end
 # ============================================================
@@ -1329,21 +1266,22 @@ if using_msvc?
   if File.exist?(makefile_path)
     content = File.read(makefile_path)
     
-    # Convert include paths
     content.gsub!(/(\s|^)-I"?([^"\s]+)"?/, ' /I"\2"')
     content.gsub!(%r{/I"([^"]+)"}) { '/I"' + $1.gsub('/', '\\') + '"' }
     
-    # Convert library paths
     content.gsub!(/(\s|^)-L"?([^"\s]+)"?/, ' /LIBPATH:"\2"')
     content.gsub!(%r{/LIBPATH:"([^"]+)"}) { '/LIBPATH:"' + $1.gsub('/', '\\') + '"' }
     
-    # Convert defines
     content.gsub!(/(\s|^)-D([^\s=]+)(?:=([^\s]+))?/, ' /D\2\3')
     
-    # Ensure compiler is clang-cl
     content.gsub!(/^CC = clang(\s|$)/, 'CC = clang-cl\1')
     
-    # Add missing MSVC flags
+    # Fix library names in Makefile
+    content.gsub!(/\bxslt\.lib\b/, 'libxslt.lib')
+    content.gsub!(/\bexslt\.lib\b/, 'libexslt.lib')
+    content.gsub!(/\bLIBS\s*=\s*(.*?)\bxslt\b/, 'LIBS = \1libxslt.lib')
+    content.gsub!(/\bLIBS\s*=\s*(.*?)\bexslt\b/, 'LIBS = \1libexslt.lib')
+    
     unless content.include?('/EHsc')
       content.gsub!(/^CFLAGS = (.*)$/, 'CFLAGS = \1 /EHsc')
     end
@@ -1355,7 +1293,6 @@ end
 # ============================================================
 
 if config_clean?
-  # Do not clean if run in a development work tree.
   File.open("Makefile", "at") do |mk|
     mk.print(<<~EOF)
 
