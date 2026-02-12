@@ -671,36 +671,97 @@ append_cppflags(ENV["CPPFLAGS"]) unless ENV["CPPFLAGS"].nil?
 append_ldflags(ENV["LDFLAGS"]) unless ENV["LDFLAGS"].nil?
 $LIBS = concat_flags($LIBS, ENV["LIBS"])
 
-# START HERE - clang-cl compatibility fix for MSVC
-if RbConfig::CONFIG['CC'] =~ /clang-cl/
-  puts "Detected clang-cl (MSVC compatibility mode). Converting flags for MSVC."
-  # Convert -I to /I for MSVC compatibility
-  $INCFLAGS = $INCFLAGS.to_s.gsub(/-I/, '/I')
-  $CPPFLAGS = $CPPFLAGS.to_s.gsub(/-I/, '/I')
-  $LIBPATHFLAG = $LIBPATHFLAG.to_s.gsub(/-L/, '/LIBPATH:')
-  # Also convert -LIBPATH: which might appear in LDFLAGS
-  $LDFLAGS = $LDFLAGS.to_s.gsub(/-L/, '/LIBPATH:')
+# ============================================================
+# MSVC/clang-cl COMPATIBILITY - EARLY DETECTION AND FLAG SANITIZATION
+# ============================================================
+def using_msvc?
+  RbConfig::CONFIG['CC'] =~ /cl|clang-cl/ || ENV['CC'] =~ /cl|clang-cl/
 end
-# END HERE
+
+if using_msvc?
+  puts "Detected MSVC/clang-cl compiler. Sanitizing flags for Windows compatibility."
+  
+  # Remove Unix-specific flags that MSVC doesn't understand
+  [
+    '-fPIC', '-fPIE', '-pthread', '-m64', '-m32', '-march=', '-mtune=', 
+    '-fuse-ld=', '-fms-runtime-lib=', '-DNDEBUG', '-D_CRT_SECURE_NO_WARNINGS'
+  ].each do |bad_flag|
+    $CFLAGS = $CFLAGS.to_s.gsub(/#{Regexp.escape(bad_flag)}[^\s]*/, '')
+    $CPPFLAGS = $CPPFLAGS.to_s.gsub(/#{Regexp.escape(bad_flag)}[^\s]*/, '')
+    $LDFLAGS = $LDFLAGS.to_s.gsub(/#{Regexp.escape(bad_flag)}[^\s]*/, '')
+    $DLDFLAGS = $DLDFLAGS.to_s.gsub(/#{Regexp.escape(bad_flag)}[^\s]*/, '')
+  end
+
+  # Convert Unix-style flags to MSVC-style
+  flag_conversions = {
+    '-I' => '/I',
+    '-isystem' => '/I',
+    '-L' => '/LIBPATH:',
+    '-D' => '/D',
+    '-std=c99' => '/std:c11',
+    '-std=c11' => '/std:c11',
+    '-O0' => '/Od',
+    '-O1' => '/O1',
+    '-O2' => '/O2',
+    '-O3' => '/O2',
+    '-Os' => '/O1',
+    '-Og' => '/Od',
+    '-g' => '/Zi',
+    '-Wall' => '/W3',
+    '-Wextra' => '/W4',
+    '-Werror' => '/WX',
+    '-Winline' => '',
+    '-Wmissing-noreturn' => '',
+    '-Wconversion' => '',
+    '-Wno-declaration-after-statement' => '',
+  }
+
+  flag_conversions.each do |unix, msvc|
+    $CFLAGS = $CFLAGS.to_s.gsub(unix, msvc)
+    $CPPFLAGS = $CPPFLAGS.to_s.gsub(unix, msvc)
+    $LDFLAGS = $LDFLAGS.to_s.gsub(unix, msvc)
+    $DLDFLAGS = $DLDFLAGS.to_s.gsub(unix, msvc)
+    $INCFLAGS = $INCFLAGS.to_s.gsub(unix, msvc)
+  end
+
+  # Add MSVC default flags
+  unless $CFLAGS.include?('/nologo')
+    $CFLAGS = "/nologo #{$CFLAGS}"
+  end
+  unless $CFLAGS.include?('/EHsc')
+    $CFLAGS = "/EHsc #{$CFLAGS}"
+  end
+  unless $CFLAGS.include?('/MD')
+    $CFLAGS = "/MD #{$CFLAGS}"
+  end
+  
+  $LDFLAGS = "/NOLOGO #{$LDFLAGS}" unless $LDFLAGS.include?('/NOLOGO')
+  $DLDFLAGS = "/NOLOGO #{$DLDFLAGS}" unless $DLDFLAGS.include?('/NOLOGO')
+  $LIBPATHFLAG = ' /LIBPATH:%s'
+  
+  puts "Sanitized CFLAGS: #{$CFLAGS}"
+  puts "Sanitized LDFLAGS: #{$LDFLAGS}"
+end
+# ============================================================
 
 # libgumbo uses C90/C99 features, see #2302
-append_cflags(["-std=c99", "-Wno-declaration-after-statement"])
+append_cflags(["-std=c99", "-Wno-declaration-after-statement"]) unless using_msvc?
 
 # gumbo html5 serialization is slower with O3, let's make sure we use O2
-append_cflags("-O2")
+append_cflags("-O2") unless using_msvc?
 
 # always include debugging information
-append_cflags("-g")
+append_cflags("-g") unless using_msvc?
 
 # we use at least one inline function in the C extension
-append_cflags("-Winline")
+append_cflags("-Winline") unless using_msvc?
 
 # good to have no matter what Ruby was compiled with
-append_cflags("-Wmissing-noreturn")
+append_cflags("-Wmissing-noreturn") unless using_msvc?
 
 # check integer loss of precision. this flag won't generally work until Ruby 3.4.
 # see https://bugs.ruby-lang.org/issues/20507
-append_cflags("-Wconversion")
+append_cflags("-Wconversion") unless using_msvc?
 
 # handle clang variations, see #1101
 if darwin?
@@ -718,8 +779,7 @@ if config_system_libraries? && darwin? && Dir.exist?(macos_mojave_sdk_include_pa
 end
 
 # Work around a character escaping bug in MSYS by passing an arbitrary double-quoted parameter to gcc.
-# See https://sourceforge.net/p/mingw/bugs/2142
-append_cppflags(' "-Idummypath"') if windows?
+append_cppflags(' "-Idummypath"') if windows? && !using_msvc?
 
 if config_system_libraries?
   message "Building nokogiri using system libraries.\n"
@@ -1076,6 +1136,9 @@ if arg_config("--gumbo-dev")
   $VPATH << "$(srcdir)/../../gumbo-parser/src"
   find_header("nokogiri_gumbo.h") || abort("nokogiri_gumbo.h not found")
 else
+  # ============================================================
+  # LIBGUMBO RECIPE - MSVC/CLANG-CL COMPATIBLE VERSION
+  # ============================================================
   libgumbo_recipe = process_recipe("libgumbo", "1.0.0-nokogiri", static_p, cross_build_p, false) do |recipe|
     recipe.configure_options = []
 
@@ -1092,71 +1155,118 @@ else
       end
 
       def configured?
-        true
+        # For MSVC/clang-cl, we need to generate a Makefile
+        if using_msvc?
+          false
+        else
+          true
+        end
+      end
+
+      def configure
+        if using_msvc?
+          Dir.chdir(work_path) do
+            output("Generating MSVC-compatible Makefile for libgumbo...")
+            
+            # Get all .c files
+            c_files = Dir.glob("*.c").map { |f| f.gsub('/', '\\') }
+            obj_files = c_files.map { |f| f.gsub('.c', '.obj') }
+            
+            File.open("Makefile", "w") do |f|
+              f.puts "# Nokogiri libgumbo Makefile for MSVC/clang-cl"
+              f.puts "# Generated by extconf.rb"
+              f.puts ""
+              f.puts "CC = clang-cl"
+              f.puts "AR = llvm-lib"
+              f.puts "CFLAGS = /nologo /O2 /EHsc /MD /I."
+              f.puts ""
+              f.puts "SOURCES = #{c_files.join(' ')}"
+              f.puts "OBJECTS = #{obj_files.join(' ')}"
+              f.puts ""
+              f.puts "all: libgumbo.a"
+              f.puts ""
+              f.puts "libgumbo.a: $(OBJECTS)"
+              f.puts "\t$(AR) /OUT:$@ $(OBJECTS)"
+              f.puts ""
+              f.puts "clean:"
+              f.puts "\t-del /Q *.obj *.a 2>nul || exit 0"
+              f.puts ""
+              f.puts "%.obj: %.c"
+              f.puts "\t$(CC) $(CFLAGS) /c $< /Fo$@"
+              f.puts ""
+              f.puts ".PHONY: all clean"
+            end
+            output("Makefile generated successfully")
+          end
+        end
+      end
+
+      def compile
+        if using_msvc?
+          # Try nmake first, fall back to make
+          if system("where nmake >nul 2>nul")
+            output("Using nmake to compile libgumbo...")
+            execute("compile", "nmake /nologo")
+          else
+            output("Using make to compile libgumbo...")
+            execute("compile", "make")
+          end
+        else
+          execute("compile", make_cmd)
+        end
       end
 
       def install
         lib_dir = File.join(port_path, "lib")
         inc_dir = File.join(port_path, "include")
         FileUtils.mkdir_p([lib_dir, inc_dir])
-        FileUtils.cp(File.join(work_path, "libgumbo.a"), lib_dir)
-        FileUtils.cp(Dir.glob(File.join(work_path, "*.h")), inc_dir)
-      end
-
-      def compile
-        cflags = concat_flags(ENV["CFLAGS"], "-fPIC", "-O2", "-g")
-
-        env = { "CC" => gcc_cmd, "CFLAGS" => cflags }
-        if config_cross_build?
-          if host.include?("darwin")
-            env["AR"] = "#{host}-libtool"
-            env["ARFLAGS"] = "-o"
+        
+        if using_msvc?
+          # MSVC: libgumbo.a is actually a .lib file
+          lib_file = File.join(work_path, "libgumbo.a")
+          if File.exist?(lib_file)
+            FileUtils.cp(lib_file, File.join(lib_dir, "libgumbo.a"))
+            output("Installed libgumbo.a to #{lib_dir}")
           else
-            env["AR"] = "#{host}-ar"
+            # Try alternative name
+            lib_file = File.join(work_path, "libgumbo.lib")
+            if File.exist?(lib_file)
+              FileUtils.cp(lib_file, File.join(lib_dir, "libgumbo.a"))
+              output("Installed libgumbo.lib as libgumbo.a")
+            end
           end
-          env["RANLIB"] = "#{host}-ranlib"
-          if windows?
-            concat_flags(env["CFLAGS"], "-D_RUBY_UCRT")
-          end
+        else
+          FileUtils.cp(File.join(work_path, "libgumbo.a"), lib_dir)
         end
-
-        execute("compile", make_cmd, { env: env })
+        
+        # Copy header files
+        headers = Dir.glob(File.join(work_path, "*.h"))
+        FileUtils.cp(headers, inc_dir)
+        output("Installed #{headers.size} header files to #{inc_dir}")
       end
     end
   end
-  
-  # START HERE - Special handling for clang-cl/MSVC and gumbo headers
-  if RbConfig::CONFIG['CC'] =~ /clang-cl/
-    puts "Adding gumbo include path for clang-cl/MSVC"
+  # ============================================================
+
+  # Add gumbo include path with MSVC-compatible flags
+  if using_msvc?
     gumbo_include = File.join(libgumbo_recipe.path, "include").gsub('/', '\\')
-    # Use both forward and backward slashes to be safe
-    append_cppflags("/I\"#{gumbo_include}\"")
-    $INCFLAGS << " /I\"#{gumbo_include}\""
+    $CPPFLAGS = "/I\"#{gumbo_include}\" #{$CPPFLAGS}"
+    $INCFLAGS = " /I\"#{gumbo_include}\" #{$INCFLAGS}"
   else
     append_cppflags("-I#{File.join(libgumbo_recipe.path, "include")}")
   end
-  # END HERE
   
   $libs = $libs + " " + File.join(libgumbo_recipe.path, "lib", "libgumbo.a")
   $LIBPATH = $LIBPATH | [File.join(libgumbo_recipe.path, "lib")]
   
-  # START HERE - Workaround for broken function signature test in clang-cl
-  if RbConfig::CONFIG['CC'] =~ /clang-cl/
-    puts "Using workaround for gumbo_parse_with_options detection with clang-cl"
+  # For MSVC/clang-cl, define the function directly since detection often fails
+  if using_msvc?
     $defs.push("-DHAVE_GUMBO_PARSE_WITH_OPTIONS")
-    # Try to find the header manually
-    gumbo_header_path = File.join(libgumbo_recipe.path, "include", "nokogiri_gumbo.h")
-    if File.exist?(gumbo_header_path)
-      puts "Found nokogiri_gumbo.h at: #{gumbo_header_path}"
-      have_header("nokogiri_gumbo.h")
-    else
-      # Try to find it in the source tree
-      find_header("nokogiri_gumbo.h") || abort("nokogiri_gumbo.h not found")
-    end
+    have_header("nokogiri_gumbo.h") || abort("nokogiri_gumbo.h not found")
   else
     ensure_func("gumbo_parse_with_options", "nokogiri_gumbo.h")
   end
-  # END HERE
 end
 
 have_func("xmlCtxtSetOptions") # introduced in libxml2 2.13.0
@@ -1186,42 +1296,63 @@ unless config_system_libraries?
   end
 end
 
-# START HERE - Convert flags for clang-cl in the Makefile generation
-if RbConfig::CONFIG['CC'] =~ /clang-cl/
-  puts "Converting Makefile flags for clang-cl compatibility"
+# ============================================================
+# FINAL MSVC/CLANG-CL FLAG CONVERSION BEFORE MAKEFILE CREATION
+# ============================================================
+if using_msvc?
+  puts "Performing final MSVC/clang-cl flag conversion..."
+  
+  # Ensure LIBPATHFLAG is set correctly
+  $LIBPATHFLAG = ' /LIBPATH:%s'
+  
+  # Convert any remaining Unix-style flags
   $INCFLAGS = $INCFLAGS.to_s.gsub(/-I/, '/I')
   $CPPFLAGS = $CPPFLAGS.to_s.gsub(/-I/, '/I')
-  $LIBPATHFLAG = $LIBPATHFLAG.to_s.gsub(/-L/, '/LIBPATH:')
+  $LDFLAGS = $LDFLAGS.to_s.gsub(/-L/, '/LIBPATH:')
+  $DLDFLAGS = $DLDFLAGS.to_s.gsub(/-L/, '/LIBPATH:')
+  
+  puts "Final CFLAGS: #{$CFLAGS}"
+  puts "Final LDFLAGS: #{$LDFLAGS}"
+  puts "Final INCFLAGS: #{$INCFLAGS}"
 end
-# END HERE
+# ============================================================
 
 create_makefile("nokogiri/nokogiri")
 
-# START HERE - Nuclear option: fix the Makefile directly for clang-cl
-if RbConfig::CONFIG['CC'] =~ /clang-cl/
-  puts "Applying final Makefile fixes for clang-cl/MSVC"
+# ============================================================
+# POST-MAKEFILE FIX FOR MSVC/CLANG-CL
+# ============================================================
+if using_msvc?
+  puts "Applying post-Makefile fixes for MSVC/clang-cl..."
   
-  # Read the generated Makefile
   makefile_path = "Makefile"
   if File.exist?(makefile_path)
-    makefile_content = File.read(makefile_path)
+    content = File.read(makefile_path)
     
-    # Fix include flags
-    makefile_content.gsub!(/ -I/, ' /I')
-    makefile_content.gsub!(/^INCFLAGS = -I/, 'INCFLAGS = /I')
+    # Convert include paths
+    content.gsub!(/(\s|^)-I"?([^"\s]+)"?/, ' /I"\2"')
+    content.gsub!(%r{/I"([^"]+)"}) { '/I"' + $1.gsub('/', '\\') + '"' }
     
-    # Fix library path flags
-    makefile_content.gsub!(/ -L/, ' /LIBPATH:')
+    # Convert library paths
+    content.gsub!(/(\s|^)-L"?([^"\s]+)"?/, ' /LIBPATH:"\2"')
+    content.gsub!(%r{/LIBPATH:"([^"]+)"}) { '/LIBPATH:"' + $1.gsub('/', '\\') + '"' }
     
-    # Fix any remaining -I flags in other variables
-    makefile_content.gsub!(/CPPFLAGS = (.*)-I/, 'CPPFLAGS = \1/I')
+    # Convert defines
+    content.gsub!(/(\s|^)-D([^\s=]+)(?:=([^\s]+))?/, ' /D\2\3')
     
-    # Write back the fixed Makefile
-    File.write(makefile_path, makefile_content)
-    puts "Converted Makefile flags for clang-cl compatibility"
+    # Ensure compiler is clang-cl
+    content.gsub!(/^CC = clang(\s|$)/, 'CC = clang-cl\1')
+    
+    # Add missing MSVC flags
+    unless content.include?('/EHsc')
+      content.gsub!(/^CFLAGS = (.*)$/, 'CFLAGS = \1 /EHsc')
+    end
+    
+    File.write(makefile_path, content)
+    puts "Makefile fixes applied successfully"
   end
 end
-# END HERE
+# ============================================================
 
 if config_clean?
   # Do not clean if run in a development work tree.
