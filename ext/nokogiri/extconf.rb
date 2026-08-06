@@ -226,7 +226,16 @@ def concat_flags(*args)
 end
 
 def local_have_library(lib, func = nil, headers = nil)
-  have_library(lib, func, headers) || have_library("lib#{lib}", func, headers)
+  candidates = [
+    lib,
+    "lib#{lib}",
+  ]
+
+  candidates << "#{lib}lib" if windows?
+
+  candidates.any? do |name|
+    have_library(name, func, headers)
+  end
 end
 
 def zlib_source(version_string)
